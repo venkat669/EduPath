@@ -1,5 +1,6 @@
 import asyncio
 import json
+import re
 import requests
 from pathlib import Path
 
@@ -9,29 +10,123 @@ from mcp.client.stdio import (
     StdioServerParameters,
 )
 
-# You are an AI assistant. Use the available tools whenever they are appropriate.
-# You: list the files in G:\PythonAI\MCP
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
 MODEL = "qwen3:14b"
 OLLAMA_URL = "http://localhost:11434/api/chat"
+
+# Change this if your MCP server is somewhere else.
+SERVER_RELATIVE_PATH = Path("Servers") / "filesystem_server.py"
+
+# Maximum number of tool/model iterations for one workflow phase.
+MAX_PHASE_ITERATIONS = 8
+
+
+# ============================================================
+# CONVERSATION
+# ============================================================
 
 ConversationWindow = []
 
 
+def add_user_message(message):
+    ConversationWindow.append({
+        "role": "user",
+        "content": message
+    })
 
-# Workflow States
+
+def add_ai_message(message):
+    ConversationWindow.append({
+        "role": "assistant",
+        "content": message
+    })
+
+
+def add_assistant_tool_calls(content, tool_calls):
+    ConversationWindow.append({
+        "role": "assistant",
+        "content": content or "",
+        "tool_calls": tool_calls
+    })
+
+
+def add_tool_message(tool_id, tool_name, result):
+    ConversationWindow.append({
+        "role": "tool",
+        "tool_call_id": tool_id,
+        "name": tool_name,
+        "content": json.dumps(result, ensure_ascii=False)
+    })
+
+
+# ============================================================
+# AUTHORITATIVE WORKFLOW STATE
+#
+# IMPORTANT:
+# Qwen does NOT control this state.
+# Python controls it.
+# ============================================================
+
 workflow_state = {
-    "profile_saved": False,
-    "skill_gap_saved": False,
-    "roadmap_saved": False,
-    "progress_saved": False
+    "phase": "WAITING_FOR_DOCUMENT",
+
+    "document": {
+        "loaded": False,
+        "path": None,
+        "content": None
+    },
+
+    "resume_facts": None,
+
+    "learner_input": {
+        "target_role": None,
+        "career_goal": None,
+        "skill_ratings": {},
+        "learning_preferences": {}
+    },
+
+    "learner_profile": None,
+
+    "skill_gaps": None,
+
+    "resources": [],
+
+    "roadmap": None,
+
+    "progress_initialized": False,
+
+    "completed": False
 }
 
 
+# ============================================================
+# EDUPATH MCP TOOLS ONLY
+#
+# Do NOT expose generic filesystem tools to Qwen.
+# ============================================================
+
+ALLOWED_TOOLS = {
+    "read_document",
+    "save_learner_profile",
+    "save_skill_gap_analysis",
+    "get_learner_profile",
+    "get_skill_gap_analysis",
+    "save_learning_roadmap",
+    "get_learning_roadmap",
+    "update_learning_progress",
+    "get_learning_progress",
+    "search_learning_resources",
+    "read_web_page",
+}
+
 
 # ============================================================
-# MCP TOOL → OLLAMA TOOL FORMAT
+# TOOL CONVERSION
 # ============================================================
-
 
 def convert_mcp_tool_to_ollama(tool):
 
@@ -41,30 +136,22 @@ def convert_mcp_tool_to_ollama(tool):
             "name": tool.name,
             "description": tool.description or "",
             "parameters": tool.input_schema,
-        },
+        }
     }
 
 
-
 # ============================================================
-# Function to extract the mcp results
+# MCP RESULT EXTRACTION
 # ============================================================
-
 
 def extract_mcp_result(mcp_result):
 
-    # --------------------------------------------------------
-    # 1. Structured content exists
-    # --------------------------------------------------------
-
-    if mcp_result.structured_content is not None:
+    # Structured result
+    if getattr(mcp_result, "structured_content", None) is not None:
         return mcp_result.structured_content
 
-    # --------------------------------------------------------
-    # 2. Fall back to normal MCP content
-    # --------------------------------------------------------
-
-    if mcp_result.content:
+    # Normal MCP text content
+    if getattr(mcp_result, "content", None):
 
         text_parts = []
 
@@ -77,835 +164,2230 @@ def extract_mcp_result(mcp_result):
 
             combined_text = "\n".join(text_parts)
 
-            # Try to convert JSON text into Python object
             try:
                 return json.loads(combined_text)
 
             except json.JSONDecodeError:
-                # It may simply be normal text
                 return combined_text
-
-    # --------------------------------------------------------
-    # 3. Nothing usable returned
-    # --------------------------------------------------------
 
     return {
         "error": "MCP tool returned no usable result"
     }
 
 
+# ============================================================
+# MCP ERROR DETECTION
+# ============================================================
+
+def tool_result_failed(mcp_result, extracted_result):
+
+    # MCP explicitly reports an error
+    if getattr(mcp_result, "is_error", False):
+        return True
+
+    # Some of your tools return:
+    #
+    # {
+    #     "error": "..."
+    # }
+    #
+    # without setting is_error=True.
+
+    if isinstance(extracted_result, dict):
+
+        if "error" in extracted_result:
+            return True
+
+    return False
 
 
 # ============================================================
-# MESSAGE FUNCTIONS
+# OLLAMA
 # ============================================================
-
-
-def add_user_message(message):
-
-    ConversationWindow.append({"role": "user", "content": message})
-
-
-def add_ai_message(message):
-
-    ConversationWindow.append({"role": "assistant", "content": message})
-
-
-def add_assistant_tool_calls(content, tool_calls):
-
-    ConversationWindow.append(
-        {"role": "assistant", "content": content or "", "tool_calls": tool_calls}
-    )
-
-
-def add_tool_message(tool_id, tool_name, message):
-
-    ConversationWindow.append(
-        {
-            "role": "tool",
-            "tool_call_id": tool_id,
-            "name": tool_name,
-            "content": json.dumps(message),
-        }
-    )
-
-
-# ============================================================
-# OLLAMA PAYLOAD
-# ============================================================
-
-
-def build_payload(system_prompt, tools):
-
-    messages = []
-
-    if system_prompt:
-
-        messages.append({"role": "system", "content": system_prompt})
-
-    messages.extend(ConversationWindow)
-
-    return {"model": MODEL, "messages": messages, "tools": tools, "stream": False}
-
-
-# ============================================================
-# CALL QWEN / OLLAMA
-# ============================================================
-
 
 def prompt_ai(payload):
 
-    response = requests.post(OLLAMA_URL, json=payload, stream=False)
+    try:
+
+        response = requests.post(
+            OLLAMA_URL,
+            json=payload,
+            timeout=300
+        )
+
+    except requests.RequestException as exc:
+
+        print("\nOllama connection error:")
+        print(exc)
+
+        return None
 
     if response.status_code != 200:
 
+        print("\nOllama HTTP error:")
+        print(response.status_code)
         print(response.text)
+
         return None
 
     return response
 
 
 # ============================================================
+# JSON EXTRACTION
+#
+# Qwen sometimes wraps JSON in markdown.
+# ============================================================
+
+def extract_json_from_text(text):
+
+    if not text:
+        return None
+
+    text = text.strip()
+
+    # Direct JSON
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    # ```json ... ```
+    match = re.search(
+        r"```json\s*(.*?)\s*```",
+        text,
+        re.IGNORECASE | re.DOTALL
+    )
+
+    if match:
+
+        try:
+            return json.loads(match.group(1))
+        except json.JSONDecodeError:
+            pass
+
+    # Find first JSON object
+    start = text.find("{")
+    end = text.rfind("}")
+
+    if start != -1 and end != -1 and end > start:
+
+        candidate = text[start:end + 1]
+
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            pass
+
+    return None
+
+
+# ============================================================
+# PROFILE VALIDATION
+# ============================================================
+
+def validate_resume_facts(data):
+
+    if not isinstance(data, dict):
+        return False
+
+    allowed = {
+        "name",
+        "skills",
+        "experience",
+        "projects"
+    }
+
+    # Remove anything outside our allowed structure.
+    data = {
+        key: value
+        for key, value in data.items()
+        if key in allowed
+    }
+
+    if "name" not in data:
+        data["name"] = None
+
+    if not isinstance(data.get("skills", []), list):
+        data["skills"] = []
+
+    if not isinstance(data.get("experience", []), list):
+        data["experience"] = []
+
+    if not isinstance(data.get("projects", []), list):
+        data["projects"] = []
+
+    return data
+
+
+# ============================================================
+# BUILD COMPACT LEARNER PROFILE
+#
+# IMPORTANT:
+# Qwen does NOT construct this.
+#
+# Python constructs it from:
+#
+# 1. Resume facts
+# 2. Explicit user answers
+# ============================================================
+
+def build_learner_profile():
+
+    facts = workflow_state["resume_facts"]
+
+    learner_input = workflow_state["learner_input"]
+
+    profile = {
+
+        "learner": {
+            "name": facts.get("name")
+        },
+
+        "current_skills": facts.get("skills", []),
+
+        "experience": facts.get("experience", []),
+
+        "projects": facts.get("projects", []),
+
+        "target_role": learner_input["target_role"],
+
+        "career_goal": learner_input["career_goal"],
+
+        "skill_ratings": learner_input["skill_ratings"],
+
+        "learning_preferences": learner_input["learning_preferences"]
+    }
+
+    return profile
+
+
+# ============================================================
+# PROFILE VALIDATION
+# ============================================================
+
+def validate_profile(profile):
+
+    required_fields = {
+        "learner",
+        "current_skills",
+        "experience",
+        "projects",
+        "target_role",
+        "career_goal",
+        "skill_ratings",
+        "learning_preferences"
+    }
+
+    if not required_fields.issubset(profile.keys()):
+        return False
+
+    if not profile["target_role"]:
+        return False
+
+    if not profile["career_goal"]:
+        return False
+
+    if not isinstance(profile["current_skills"], list):
+        return False
+
+    if not isinstance(profile["experience"], list):
+        return False
+
+    if not isinstance(profile["projects"], list):
+        return False
+
+    if not isinstance(profile["skill_ratings"], dict):
+        return False
+
+    return True
+
+
+# ============================================================
+# CURRENT WORKFLOW CONTEXT
+# ============================================================
+
+def workflow_context():
+
+    state = workflow_state
+
+    return f"""
+CURRENT EDUPATH STATE
+
+phase: {state["phase"]}
+
+document_loaded: {state["document"]["loaded"]}
+document_path: {state["document"]["path"]}
+
+resume_facts_extracted:
+{json.dumps(state["resume_facts"], indent=2, ensure_ascii=False)
+ if state["resume_facts"] else "NOT YET"}
+
+learner_profile:
+{json.dumps(state["learner_profile"], indent=2, ensure_ascii=False)
+ if state["learner_profile"] else "NOT YET"}
+
+skill_gaps:
+{json.dumps(state["skill_gaps"], indent=2, ensure_ascii=False)
+ if state["skill_gaps"] else "NOT YET"}
+
+resources:
+{json.dumps(state["resources"], indent=2, ensure_ascii=False)}
+
+roadmap:
+{json.dumps(state["roadmap"], indent=2, ensure_ascii=False)
+ if state["roadmap"] else "NOT YET"}
+
+RULE:
+
+Python controls the workflow state.
+
+Do NOT assume that a step has been completed unless the
+Python state says it has been completed.
+
+Do NOT invent learner facts.
+"""
+
+
+# ============================================================
+# PAYLOAD
+# ============================================================
+
+def build_payload(system_prompt, tools):
+
+    messages = []
+
+    messages.append({
+        "role": "system",
+        "content": (
+            system_prompt
+            + "\n\n"
+            + workflow_context()
+        )
+    })
+
+    messages.extend(ConversationWindow)
+
+    return {
+        "model": MODEL,
+        "messages": messages,
+        "tools": tools,
+        "stream": False
+    }
+
+
+# ============================================================
+# PHASE PROMPTS
+# ============================================================
+
+DOCUMENT_PROMPT = """
+You are EduPath.
+
+CURRENT PHASE:
+DOCUMENT
+
+The learner has provided a document.
+
+Your ONLY job in this phase is:
+
+1. Call read_document using the exact document path supplied
+   by the learner.
+2. Do not call any other tool.
+3. Do not create a learner profile.
+4. Do not invent information.
+5. Do not ask the learner for skills that can be extracted
+   from the document.
+
+After read_document returns, stop.
+"""
+
+
+RESUME_EXTRACTION_PROMPT = """
+You are EduPath.
+
+CURRENT PHASE:
+RESUME_EXTRACTION
+
+The document has already been read.
+
+The complete document content is available in the previous
+tool result.
+
+Extract ONLY facts explicitly supported by the document.
+
+Return ONLY valid JSON.
+
+Required format:
+
+{
+    "name": "string or null",
+
+    "skills": [
+        {
+            "name": "Java",
+            "evidence": "resume"
+        }
+    ],
+
+    "experience": [
+        {
+            "company": "string",
+            "role": "string",
+            "period": "string",
+            "responsibilities": []
+        }
+    ],
+
+    "projects": [
+        {
+            "name": "string",
+            "technologies": [],
+            "description": "string"
+        }
+    ]
+}
+
+IMPORTANT:
+
+A skill listed in the resume is evidence that the resume
+claims the learner has that skill.
+
+Do NOT convert it into a numeric proficiency.
+
+If the resume says:
+
+Python (Basic)
+
+preserve:
+
+{
+    "name": "Python",
+    "evidence": "resume states Basic"
+}
+
+Do not invent:
+
+{
+    "rating": 2
+}
+
+Do not invent target roles.
+
+Do not invent career goals.
+
+Do not invent experience years.
+
+Do not invent projects.
+
+Do not invent technologies.
+
+Only extract what the document supports.
+"""
+
+
+PROFILE_QUESTION_PROMPT = """
+You are EduPath.
+
+CURRENT PHASE:
+PROFILE_INFORMATION
+
+The resume facts have already been extracted.
+
+The following information is still required from the learner:
+
+- target role
+- career goal
+- optionally skill ratings for important skills
+
+Do NOT ask for information that already exists in the resume.
+
+Ask the learner for the missing information.
+
+Use exactly:
+
+<NEEDS_USER_INPUT>
+your question
+</NEEDS_USER_INPUT>
+
+Do not create the profile yet.
+"""
+
+
+SKILL_GAP_PROMPT = """
+You are EduPath.
+
+CURRENT PHASE:
+SKILL_GAP_ANALYSIS
+
+Use ONLY the authoritative learner profile provided in the
+workflow state.
+
+Compare:
+
+current skills
++
+experience
++
+projects
+
+against:
+
+target role
++
+career goal
+
+Return ONLY valid JSON.
+
+Format:
+
+{
+    "target_role": "...",
+
+    "gaps": [
+        {
+            "skill": "...",
+            "current_evidence": "...",
+            "required_for_role": "...",
+            "gap": "...",
+            "priority": "high|medium|low"
+        }
+    ]
+}
+
+Rules:
+
+Do not invent current skills.
+
+Do not invent experience.
+
+Do not invent skill ratings.
+
+Do not claim that the learner knows something that is not
+supported by the profile.
+
+The skill gap is an AI-derived analysis, not a learner fact.
+"""
+
+
+RESOURCE_PROMPT = """
+You are EduPath.
+
+CURRENT PHASE:
+RESOURCE_RESEARCH
+
+Use the saved skill-gap analysis.
+
+For important gaps, use search_learning_resources.
+
+Rules:
+
+1. Search only for actual identified gaps.
+2. Do not search for skills the learner already knows unless
+   the gap analysis explicitly says advanced knowledge is needed.
+3. Do not invent search results.
+4. If a search fails, do not repeatedly call the same search.
+5. A failed search does not mean the learner has a new gap.
+"""
+
+
+ROADMAP_PROMPT = """
+You are EduPath's roadmap generation engine.
+
+Your ONLY task is to convert the supplied learner profile, skill-gap analysis,
+and researched resources into a 12-week learning roadmap.
+
+Target role: Senior Software Engineer
+Career goal: Software Engineer who is an expert in Agentic AI and Spring Boot.
+
+OUTPUT RULES:
+1. Return ONLY one valid JSON object.
+2. The first character MUST be { and the last character MUST be }.
+3. No Markdown, code fences, explanations, headings, summaries, or text outside JSON.
+4. Do NOT perform web searches.
+5. Do NOT invent URLs or resources. If a week has no suitable supplied resource, use an empty resources array.
+6. Use only supplied resources when assigning resources to weeks.
+7. Create exactly 12 weeks, numbered 1 through 12.
+8. Every week must have status "not_started" and progressPercentage 0.
+9. Every practice task must have status "not_started".
+
+Required structure:
+
+{
+  "roadmap": {
+    "targetRole": "Senior Software Engineer",
+    "careerGoal": "Software Engineer who is an expert in Agentic AI and Spring Boot",
+    "timelineWeeks": 12,
+    "currentSkills": [],
+    "priorityGaps": [],
+    "weeks": [
+      {
+        "weekNumber": 1,
+        "title": "string",
+        "status": "not_started",
+        "progressPercentage": 0,
+        "objectives": [],
+        "resources": [
+          {
+            "title": "string",
+            "url": "string",
+            "type": "string"
+          }
+        ],
+        "practiceTasks": [
+          {
+            "id": "w1-t1",
+            "title": "string",
+            "status": "not_started"
+          }
+        ],
+        "completionCriteria": []
+      }
+    ]
+  }
+}
+
+The roadmap must progress logically from Agentic AI and Spring Boot foundations
+through implementation, tool calling, MCP, RAG, architecture, production
+engineering, cloud, and a capstone.
+
+Use the learner profile and supplied skill gaps as authoritative inputs.
+Do not invent learner experience.
+
+OUTPUT JSON ONLY. NO OTHER TEXT.
+"""
+
+
+# ============================================================
+# USER INPUT EXTRACTION
+# ============================================================
+
+NEEDS_USER_INPUT_PATTERN = re.compile(
+    r"<NEEDS_USER_INPUT>\s*(.*?)\s*</NEEDS_USER_INPUT>",
+    re.IGNORECASE | re.DOTALL
+)
+
+
+def extract_user_question(content):
+
+    match = NEEDS_USER_INPUT_PATTERN.search(content or "")
+
+    if not match:
+        return None
+
+    return match.group(1).strip()
+
+
+# ============================================================
+# DOCUMENT PATH EXTRACTION
+# ============================================================
+
+def extract_document_path(user_message):
+
+    # Windows quoted path
+    match = re.search(
+        r'"([A-Za-z]:\\[^"]+\.(?:pdf|txt))"',
+        user_message,
+        re.IGNORECASE
+    )
+
+    if match:
+        return match.group(1)
+
+    # Windows unquoted path
+    match = re.search(
+        r'([A-Za-z]:\\[^\s"]+\.(?:pdf|txt))',
+        user_message,
+        re.IGNORECASE
+    )
+
+    if match:
+        return match.group(1)
+
+    return None
+
+
+# ============================================================
+# MCP TOOL ARGUMENT NORMALIZATION
+# ============================================================
+
+def normalize_arguments(arguments):
+
+    if isinstance(arguments, str):
+
+        try:
+            arguments = json.loads(arguments)
+
+        except json.JSONDecodeError:
+
+            return None
+
+    if not isinstance(arguments, dict):
+        return None
+
+    return arguments
+
+
+# ============================================================
+# TOOL PHASE PERMISSION
+# ============================================================
+
+def tool_allowed_in_phase(tool_name):
+
+    phase = workflow_state["phase"]
+
+    allowed = {
+
+        "WAITING_FOR_DOCUMENT": {
+            "read_document"
+        },
+
+        "DOCUMENT": {
+            "read_document"
+        },
+
+        "RESUME_EXTRACTION": set(),
+
+        "PROFILE_INFORMATION": set(),
+
+        "SAVE_PROFILE": {
+            "save_learner_profile"
+        },
+
+        "SKILL_GAP_ANALYSIS": {
+            "get_learner_profile",
+            "save_skill_gap_analysis"
+        },
+
+        "RESOURCE_RESEARCH": {
+            "search_learning_resources",
+            "read_web_page"
+        },
+
+        "ROADMAP": {
+            "save_learning_roadmap"
+        },
+
+        "PROGRESS": {
+            "update_learning_progress"
+        },
+
+        "COMPLETE": {
+            "get_learning_progress"
+        }
+    }
+
+    return tool_name in allowed.get(phase, set())
+
+
+# ============================================================
+# EXECUTE ONE QWEN TURN
+# ============================================================
+
+async def run_qwen_turn(
+    session,
+    ollama_tools,
+    system_prompt
+):
+
+    payload = build_payload(
+        system_prompt,
+        ollama_tools
+    )
+
+    response = prompt_ai(payload)
+
+    if response is None:
+        return None
+
+    result = response.json()
+
+    message = result.get("message", {})
+
+    return message
+
+
+# ============================================================
+# DOCUMENT PHASE
+# ============================================================
+
+async def process_document_phase(
+    session,
+    ollama_tools
+):
+
+    workflow_state["phase"] = "DOCUMENT"
+
+    for iteration in range(MAX_PHASE_ITERATIONS):
+
+        message = await run_qwen_turn(
+            session,
+            ollama_tools,
+            DOCUMENT_PROMPT
+        )
+
+        if message is None:
+            return False
+
+        tool_calls = message.get("tool_calls") or []
+
+        if not tool_calls:
+            print("\nQwen did not call read_document.")
+            return False
+
+        add_assistant_tool_calls(
+            message.get("content", ""),
+            tool_calls
+        )
+
+        for tool in tool_calls:
+
+            tool_name = tool["function"]["name"]
+
+            arguments = normalize_arguments(
+                tool["function"]["arguments"]
+            )
+
+            if tool_name != "read_document":
+
+                result = {
+                    "error": (
+                        "Only read_document is allowed during "
+                        "the document phase."
+                    )
+                }
+
+                add_tool_message(
+                    tool["id"],
+                    tool_name,
+                    result
+                )
+
+                continue
+
+            if arguments is None:
+
+                result = {
+                    "error": "Invalid tool arguments."
+                }
+
+                add_tool_message(
+                    tool["id"],
+                    tool_name,
+                    result
+                )
+
+                continue
+
+            # ------------------------------------------------
+            # IMPORTANT:
+            #
+            # We DO NOT block rereading by returning an error.
+            #
+            # The phase controller prevents unnecessary calls.
+            # ------------------------------------------------
+
+            mcp_result = await session.call_tool(
+                tool_name,
+                arguments=arguments
+            )
+
+            extracted = extract_mcp_result(mcp_result)
+
+            failed = tool_result_failed(
+                mcp_result,
+                extracted
+            )
+
+            print("\nMCP read_document result:")
+
+            if isinstance(extracted, str):
+                print(extracted[:3000])
+
+            else:
+                print(
+                    json.dumps(
+                        extracted,
+                        indent=2,
+                        ensure_ascii=False
+                    )[:3000]
+                )
+
+            add_tool_message(
+                tool["id"],
+                tool_name,
+                extracted
+            )
+
+            if failed:
+
+                print("\nDocument reading failed.")
+
+                return False
+
+            # ----------------------------------------------
+            # SAVE THE ACTUAL DOCUMENT CONTENT IN PYTHON
+            # ----------------------------------------------
+
+            document_content = None
+
+            if isinstance(extracted, dict):
+
+                document_content = (
+                    extracted.get("text")
+                    or extracted.get("content")
+                    or extracted.get("document")
+                )
+
+            elif isinstance(extracted, str):
+
+                document_content = extracted
+
+            if not document_content:
+
+                print(
+                    "\nread_document succeeded but returned "
+                    "no document text."
+                )
+
+                return False
+
+            workflow_state["document"]["loaded"] = True
+
+            workflow_state["document"]["content"] = (
+                document_content
+            )
+
+            workflow_state["document"]["path"] = (
+                arguments.get("file_path")
+                or arguments.get("path")
+            )
+
+            return True
+
+    return False
+
+
+# ============================================================
+# RESUME EXTRACTION
+# ============================================================
+
+async def extract_resume_facts():
+
+    workflow_state["phase"] = "RESUME_EXTRACTION"
+
+    document_content = workflow_state["document"]["content"]
+
+    # We intentionally use a fresh mini conversation here.
+    #
+    # This prevents old tool-call history from confusing Qwen.
+
+    messages = [
+
+        {
+            "role": "system",
+            "content": RESUME_EXTRACTION_PROMPT
+        },
+
+        {
+            "role": "user",
+            "content": (
+                "Extract facts from this document:\n\n"
+                + document_content
+            )
+        }
+    ]
+
+    payload = {
+        "model": MODEL,
+        "messages": messages,
+        "stream": False
+    }
+
+    response = prompt_ai(payload)
+
+    if response is None:
+        return False
+
+    result = response.json()
+
+    content = result.get(
+        "message",
+        {}
+    ).get(
+        "content",
+        ""
+    )
+
+    print("\nResume extraction:")
+    print(content)
+
+    facts = extract_json_from_text(content)
+
+    if facts is None:
+
+        print(
+            "\nQwen did not return valid resume JSON."
+        )
+
+        return False
+
+    facts = validate_resume_facts(facts)
+
+    workflow_state["resume_facts"] = facts
+
+    return True
+
+
+# ============================================================
+# GET USER INFORMATION
+# ============================================================
+
+def request_missing_profile_information():
+
+    missing = []
+
+    if not workflow_state["learner_input"]["target_role"]:
+        missing.append("target role")
+
+    if not workflow_state["learner_input"]["career_goal"]:
+        missing.append("career goal")
+
+    print("\n========================================")
+    print("Additional learner information required")
+    print("========================================")
+
+    if "target role" in missing:
+
+        answer = input(
+            "\nWhat role are you preparing for? "
+        ).strip()
+
+        if answer:
+
+            workflow_state[
+                "learner_input"
+            ]["target_role"] = answer
+
+    if "career goal" in missing:
+
+        answer = input(
+            "\nWhat is your career goal? "
+        ).strip()
+
+        if answer:
+
+            workflow_state[
+                "learner_input"
+            ]["career_goal"] = answer
+
+    return (
+        bool(workflow_state["learner_input"]["target_role"])
+        and
+        bool(workflow_state["learner_input"]["career_goal"])
+    )
+
+
+# ============================================================
+# SAVE PROFILE
+# ============================================================
+
+async def save_profile(
+    session,
+    mcp_tools
+):
+
+    workflow_state["phase"] = "SAVE_PROFILE"
+
+    profile = build_learner_profile()
+
+    if not validate_profile(profile):
+
+        print(
+            "\nProfile validation failed."
+        )
+
+        return False
+
+    workflow_state["learner_profile"] = profile
+
+    profile_json = json.dumps(
+        profile,
+        indent=2,
+        ensure_ascii=False
+    )
+
+    print("\n========================================")
+    print("Learner Profile")
+    print("========================================")
+
+    print(profile_json)
+
+    mcp_result = await session.call_tool(
+        "save_learner_profile",
+        arguments={
+            "profile_json": profile_json
+        }
+    )
+
+    extracted = extract_mcp_result(mcp_result)
+
+    if tool_result_failed(
+        mcp_result,
+        extracted
+    ):
+
+        print("\nFailed to save learner profile:")
+        print(extracted)
+
+        return False
+
+    print("\nLearner profile saved successfully.")
+
+    return True
+
+
+# ============================================================
+# SKILL GAP ANALYSIS
+# ============================================================
+
+async def create_skill_gap_analysis(
+    session,
+    ollama_tools
+):
+
+    workflow_state["phase"] = "SKILL_GAP_ANALYSIS"
+
+    messages = [
+
+        {
+            "role": "system",
+            "content": SKILL_GAP_PROMPT
+        },
+
+        {
+            "role": "user",
+            "content": (
+                "Analyze this authoritative learner profile:\n\n"
+                +
+                json.dumps(
+                    workflow_state["learner_profile"],
+                    indent=2,
+                    ensure_ascii=False
+                )
+            )
+        }
+    ]
+
+    payload = {
+        "model": MODEL,
+        "messages": messages,
+        "stream": False
+    }
+
+    response = prompt_ai(payload)
+
+    if response is None:
+        return False
+
+    result = response.json()
+
+    content = result.get(
+        "message",
+        {}
+    ).get(
+        "content",
+        ""
+    )
+
+    print("\nSkill gap analysis:")
+    print(content)
+
+    gaps = extract_json_from_text(content)
+
+    if gaps is None:
+
+        print(
+            "\nInvalid skill gap JSON."
+        )
+
+        return False
+
+    workflow_state["skill_gaps"] = gaps
+
+    gap_json = json.dumps(
+        gaps,
+        indent=2,
+        ensure_ascii=False
+    )
+
+    mcp_result = await session.call_tool(
+        "save_skill_gap_analysis",
+        arguments={
+            "gap_analysis_json": gap_json
+        }
+    )
+
+    extracted = extract_mcp_result(mcp_result)
+
+    if tool_result_failed(
+        mcp_result,
+        extracted
+    ):
+
+        print("\nFailed to save skill gaps:")
+        print(extracted)
+
+        return False
+
+    print(
+        "\nSkill-gap analysis saved successfully."
+    )
+
+    return True
+
+
+# ============================================================
+# RESOURCE RESEARCH
+# ============================================================
+
+async def research_resources(
+    session,
+    ollama_tools
+):
+
+    workflow_state["phase"] = "RESOURCE_RESEARCH"
+
+    gaps = workflow_state["skill_gaps"]
+
+    if not isinstance(gaps, dict):
+        return False
+
+    gap_list = gaps.get(
+        "gaps",
+        []
+    )
+
+    # Only research the most important gaps.
+    gap_list = gap_list[:5]
+
+    for gap in gap_list:
+
+        topic = gap.get("skill")
+
+        if not topic:
+            continue
+
+        priority = gap.get(
+            "priority",
+            "medium"
+        )
+
+        if priority == "low":
+            continue
+
+        # Determine a reasonable search level.
+        level = "beginner"
+
+        search_args = {
+            "topic": topic,
+            "level": level
+        }
+
+        print(
+            f"\nSearching resources for: {topic}"
+        )
+
+        mcp_result = await session.call_tool(
+            "search_learning_resources",
+            arguments=search_args
+        )
+
+        extracted = extract_mcp_result(
+            mcp_result
+        )
+
+        if tool_result_failed(
+            mcp_result,
+            extracted
+        ):
+
+            print(
+                f"Resource search failed for {topic}"
+            )
+
+            # IMPORTANT:
+            #
+            # Do NOT ask Qwen to endlessly retry.
+            #
+            continue
+
+        if isinstance(extracted, dict):
+
+            if "resources" in extracted:
+
+                workflow_state[
+                    "resources"
+                ].extend(
+                    extracted["resources"]
+                )
+
+            elif "error" not in extracted:
+
+                workflow_state[
+                    "resources"
+                ].append(extracted)
+
+        elif isinstance(extracted, list):
+
+            workflow_state[
+                "resources"
+            ].extend(extracted)
+
+    return True
+
+
+# ============================================================
+# STRUCTURED JSON GENERATION
+# ============================================================
+
+async def generate_json_with_repair(
+    purpose,
+    context,
+    system_prompt,
+    max_attempts=2
+):
+    """
+    Ask the local Ollama model for JSON and perform one bounded repair
+    attempt if the model returns prose, markdown, or malformed JSON.
+
+    Python remains authoritative: this helper only generates content.
+    """
+
+    base_user_prompt = (
+        f"Generate the requested {purpose} from the supplied data.\n\n"
+        "AUTHORITATIVE DATA:\n"
+        + json.dumps(
+            context,
+            indent=2,
+            ensure_ascii=False
+        )
+        + "\n\n"
+        "OUTPUT REQUIREMENT:\n"
+        "Return ONLY a valid JSON object. "
+        "Do not include Markdown, code fences, explanations, headings, "
+        "or any text before or after the JSON."
+    )
+
+    messages = [
+        {
+            "role": "system",
+            "content": system_prompt
+        },
+        {
+            "role": "user",
+            "content": base_user_prompt
+        }
+    ]
+
+    for attempt in range(1, max_attempts + 1):
+
+        payload = {
+            "model": MODEL,
+            "messages": messages,
+            "stream": False,
+            "format": "json"
+        }
+
+        response = prompt_ai(payload)
+
+        if response is None:
+            return None
+
+        try:
+            result = response.json()
+        except Exception:
+            result = {}
+
+        message = result.get("message") or {}
+
+        content = message.get("content") or ""
+
+        parsed = extract_json_from_text(content)
+
+        if isinstance(parsed, dict):
+            return parsed
+
+        if attempt < max_attempts:
+
+            messages = [
+                {
+                    "role": "system",
+                    "content": (
+                        system_prompt
+                        + "\n\nABSOLUTE RULE: "
+                        "Your entire response must be one JSON object."
+                    )
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        "Your previous response was not valid JSON. "
+                        "Regenerate it from the same authoritative data. "
+                        "Return ONLY the JSON object.\n\n"
+                        + base_user_prompt
+                    )
+                }
+            ]
+
+    return None
+
+
+# ============================================================
+# CREATE ROADMAP
+# ============================================================
+
+async def create_roadmap(session):
+
+    workflow_state["phase"] = "ROADMAP"
+
+    context = {
+        "learner_profile": workflow_state["learner_profile"],
+        "skill_gaps": workflow_state["skill_gaps"],
+        "resources": workflow_state["resources"]
+    }
+
+    print("\nGenerating 12-week learning roadmap...")
+
+    roadmap_response = await generate_json_with_repair(
+        purpose="12-week learning roadmap",
+        context=context,
+        system_prompt=ROADMAP_PROMPT,
+        max_attempts=2
+    )
+
+    if not isinstance(roadmap_response, dict):
+        print(
+            "\nThe AI did not return a valid roadmap JSON object."
+        )
+        return False
+
+    roadmap_data = roadmap_response.get("roadmap")
+
+    if not isinstance(roadmap_data, dict):
+        print("\nRoadmap JSON is missing the 'roadmap' object.")
+        return False
+
+    weeks = roadmap_data.get("weeks")
+
+    if not isinstance(weeks, list):
+        print("\nRoadmap JSON is missing the 'weeks' array.")
+        return False
+
+    if len(weeks) != 12:
+        print(
+            f"\nRoadmap must contain exactly 12 weeks. "
+            f"Received {len(weeks)}."
+        )
+        return False
+
+    required_week_fields = {
+        "weekNumber",
+        "title",
+        "status",
+        "progressPercentage",
+        "objectives",
+        "resources",
+        "practiceTasks",
+        "completionCriteria"
+    }
+
+    for expected_number, week in enumerate(weeks, start=1):
+
+        if not isinstance(week, dict):
+            print(f"\nWeek {expected_number} is not an object.")
+            return False
+
+        missing = required_week_fields - set(week)
+
+        if missing:
+            print(
+                f"\nWeek {expected_number} is missing: "
+                + ", ".join(sorted(missing))
+            )
+            return False
+
+        if week["weekNumber"] != expected_number:
+            print(
+                f"\nExpected week {expected_number}, "
+                f"received {week['weekNumber']}."
+            )
+            return False
+
+        if week["status"] != "not_started":
+            week["status"] = "not_started"
+
+        week["progressPercentage"] = 0
+
+        if not isinstance(week["objectives"], list):
+            return False
+
+        if not isinstance(week["resources"], list):
+            return False
+
+        if not isinstance(week["practiceTasks"], list):
+            return False
+
+        if not isinstance(week["completionCriteria"], list):
+            return False
+
+        for task_index, task in enumerate(
+            week["practiceTasks"],
+            start=1
+        ):
+
+            if not isinstance(task, dict):
+                print(
+                    f"\nWeek {expected_number}, task "
+                    f"{task_index} is invalid."
+                )
+                return False
+
+            if not task.get("id"):
+                task["id"] = (
+                    f"w{expected_number}-t{task_index}"
+                )
+
+            if not task.get("title"):
+                print(
+                    f"\nWeek {expected_number}, task "
+                    f"{task_index} has no title."
+                )
+                return False
+
+            task["status"] = "not_started"
+
+        # Normalize resource objects so the saved schema is predictable.
+        normalized_resources = []
+
+        for resource in week["resources"]:
+
+            if isinstance(resource, str):
+                normalized_resources.append(
+                    {
+                        "title": resource,
+                        "url": "",
+                        "type": "resource"
+                    }
+                )
+                continue
+
+            if isinstance(resource, dict):
+                normalized_resources.append(
+                    {
+                        "title": str(
+                            resource.get(
+                                "title",
+                                "Resource"
+                            )
+                        ),
+                        "url": str(
+                            resource.get(
+                                "url",
+                                ""
+                            )
+                        ),
+                        "type": str(
+                            resource.get(
+                                "type",
+                                "resource"
+                            )
+                        )
+                    }
+                )
+
+        week["resources"] = normalized_resources
+
+    canonical_roadmap = {
+        "roadmap": {
+            "targetRole": roadmap_data.get(
+                "targetRole",
+                context["learner_profile"].get(
+                    "target_role",
+                    "Senior Software Engineer"
+                )
+            ),
+            "careerGoal": roadmap_data.get(
+                "careerGoal",
+                context["learner_profile"].get(
+                    "career_goal",
+                    ""
+                )
+            ),
+            "timelineWeeks": 12,
+            "currentSkills": roadmap_data.get(
+                "currentSkills",
+                []
+            ),
+            "priorityGaps": roadmap_data.get(
+                "priorityGaps",
+                []
+            ),
+            "weeks": weeks
+        }
+    }
+
+    workflow_state["roadmap"] = canonical_roadmap
+
+    roadmap_json = json.dumps(
+        canonical_roadmap,
+        indent=2,
+        ensure_ascii=False
+    )
+
+    mcp_result = await session.call_tool(
+        "save_learning_roadmap",
+        arguments={
+            "roadmap_json": roadmap_json
+        }
+    )
+
+    extracted = extract_mcp_result(mcp_result)
+
+    if tool_result_failed(
+        mcp_result,
+        extracted
+    ):
+        print("\nFailed to save roadmap:")
+
+        if isinstance(extracted, dict):
+            print(
+                json.dumps(
+                    extracted,
+                    indent=2,
+                    ensure_ascii=False
+                )
+            )
+        else:
+            print(extracted)
+
+        return False
+
+    print("\nRoadmap generated and saved successfully.")
+
+    if isinstance(extracted, dict):
+
+        saved_path = extracted.get("path")
+
+        if saved_path:
+            print(
+                f"\nRoadmap file:\n{saved_path}"
+            )
+
+    return True
+
+
+# ============================================================
+# INITIALIZE PROGRESS
+# ============================================================
+
+async def initialize_progress(session):
+
+    workflow_state["phase"] = "PROGRESS"
+
+    roadmap_wrapper = workflow_state["roadmap"]
+
+    if not isinstance(roadmap_wrapper, dict):
+        print("\nInvalid roadmap state.")
+        return False
+
+    roadmap = roadmap_wrapper.get("roadmap")
+
+    if not isinstance(roadmap, dict):
+        print("\nRoadmap object missing.")
+        return False
+
+    weeks = roadmap.get("weeks", [])
+
+    if not weeks:
+        print("\nRoadmap contains no weeks.")
+        return False
+
+    first_week = weeks[0]
+
+    week_number = first_week.get("weekNumber")
+    topic = first_week.get("title", "Learning roadmap")
+
+    if week_number is None:
+        print("\nFirst week does not contain weekNumber.")
+        return False
+
+    mcp_result = await session.call_tool(
+        "update_learning_progress",
+        arguments={
+            "week": week_number,
+            "topic": topic,
+            "status": "not_started",
+            "notes": "Roadmap initialized."
+        }
+    )
+
+    extracted = extract_mcp_result(mcp_result)
+
+    if tool_result_failed(mcp_result, extracted):
+        print("\nFailed to initialize progress:")
+        print(extracted)
+        return False
+
+    workflow_state["progress_initialized"] = True
+
+    print("\nProgress tracking initialized.")
+
+    return True
+
+
+# ============================================================
+# FINAL RESPONSE
+# ============================================================
+
+def print_final_result():
+
+    workflow_state["phase"] = "COMPLETE"
+    workflow_state["completed"] = True
+
+    profile = workflow_state[
+        "learner_profile"
+    ]
+
+    gaps = workflow_state[
+        "skill_gaps"
+    ]
+
+    roadmap = workflow_state[
+        "roadmap"
+    ]
+
+    print("\n")
+    print("=" * 70)
+    print("EDUPATH LEARNING PLAN")
+    print("=" * 70)
+
+    print("\nLEARNER")
+
+    print(
+        profile["learner"]["name"]
+    )
+
+    print("\nTARGET ROLE")
+
+    print(
+        profile["target_role"]
+    )
+
+    print("\nCAREER GOAL")
+
+    print(
+        profile["career_goal"]
+    )
+
+    print("\nCURRENT SKILLS")
+
+    for skill in profile["current_skills"]:
+
+        if isinstance(skill, dict):
+
+            print(
+                f" - {skill.get('name')}: "
+                f"{skill.get('evidence', '')}"
+            )
+
+        else:
+
+            print(
+                f" - {skill}"
+            )
+
+    print("\nSKILL GAPS")
+
+    for gap in gaps.get(
+        "gaps",
+        []
+    ):
+
+        print(
+            f" - {gap.get('skill')} "
+            f"[{gap.get('priority')}]"
+        )
+
+        print(
+            f"   {gap.get('gap')}"
+        )
+
+    print("\nROADMAP")
+
+    roadmap_data = roadmap.get(
+        "roadmap",
+        {}
+    )
+
+    for week in roadmap_data.get(
+        "weeks",
+        []
+    ):
+
+        print("\n" + "-" * 60)
+
+        print(
+            f"Week {week.get('weekNumber')}: "
+            f"{week.get('title')}"
+        )
+
+        print(
+            f"Status: {week.get('status')}"
+        )
+
+        print(
+            f"Progress: {week.get('progressPercentage')}%"
+        )
+
+        print("\nObjectives:")
+
+        for item in week.get(
+            "objectives",
+            []
+        ):
+            print(f" - {item}")
+
+        print("\nResources:")
+
+        for resource in week.get(
+            "resources",
+            []
+        ):
+
+            if isinstance(resource, dict):
+                print(
+                    f" - {resource.get('title', 'Resource')}"
+                )
+
+                if resource.get("url"):
+                    print(
+                        f"   {resource['url']}"
+                    )
+            else:
+                print(f" - {resource}")
+
+        print("\nPractice Tasks:")
+
+        for task in week.get(
+            "practiceTasks",
+            []
+        ):
+
+            if isinstance(task, dict):
+                print(
+                    f" - {task.get('title')} "
+                    f"[{task.get('status')}]"
+                )
+            else:
+                print(f" - {task}")
+
+        print("\nCompletion Criteria:")
+
+        for item in week.get(
+            "completionCriteria",
+            []
+        ):
+            print(f" - {item}")
+
+    print("\n")
+    print("=" * 70)
+    print("EDUPATH WORKFLOW COMPLETED")
+    print("=" * 70)
+
+
+# ============================================================
 # MAIN
 # ============================================================
 
-
 async def main():
 
+    client_directory = Path(
+        __file__
+    ).parent
+
+    server_path = (
+        client_directory
+        / SERVER_RELATIVE_PATH
+    )
+
+    print(
+        "\nMCP Server:"
+    )
+
+    print(
+        server_path
+    )
+
+    if not server_path.exists():
+
+        print(
+            "\nERROR:"
+        )
+
+        print(
+            f"MCP server not found: {server_path}"
+        )
+
+        return
+
     # --------------------------------------------------------
-    # Locate MCP Server
-    # --------------------------------------------------------
-
-    client_directory = Path(__file__).parent
-
-    server_path = client_directory / "Servers" / "filesystem_server.py"
-
-    print("\nMCP Server:")
-    print(server_path)
-
-    # --------------------------------------------------------
-    # Configure MCP Server
+    # START MCP
     # --------------------------------------------------------
 
     server_params = StdioServerParameters(
         command="python",
-        args=[str(server_path)],
+        args=[
+            str(server_path)
+        ]
     )
 
-    # --------------------------------------------------------
-    # Start MCP Server
-    # --------------------------------------------------------
+    async with stdio_client(
+        server_params
+    ) as (read, write):
 
-    async with stdio_client(server_params) as (read, write):
-
-        async with ClientSession(read, write) as session:
-
-            # ------------------------------------------------
-            # Initialize MCP
-            # ------------------------------------------------
+        async with ClientSession(
+            read,
+            write
+        ) as session:
 
             await session.initialize()
 
-            print("\nMCP connection established!")
+            print(
+                "\nMCP connection established!"
+            )
 
             # ------------------------------------------------
-            # Get MCP Tools
+            # GET TOOLS
             # ------------------------------------------------
 
-            mcp_response = await session.list_tools()
+            mcp_response = (
+                await session.list_tools()
+            )
 
-            print("\nAvailable MCP Tools:")
+            all_tools = (
+                mcp_response.tools
+            )
 
-            for tool in mcp_response.tools:
+            print(
+                "\nAvailable MCP tools:"
+            )
 
-                print(" -", tool.name)
+            for tool in all_tools:
+
+                print(
+                    f" - {tool.name}"
+                )
 
             # ------------------------------------------------
-            # Convert MCP tools to Ollama format
+            # ONLY SEND EDUPATH TOOLS TO QWEN
             # ------------------------------------------------
 
-            MCP_TOOLS = [
-                convert_mcp_tool_to_ollama(tool) for tool in mcp_response.tools
+            edupath_tools = [
+
+                tool
+                for tool in all_tools
+                if tool.name in ALLOWED_TOOLS
+
             ]
 
-            print("\nTools sent to Qwen:")
+            ollama_tools = [
 
-            for tool in MCP_TOOLS:
+                convert_mcp_tool_to_ollama(
+                    tool
+                )
 
-                
+                for tool in edupath_tools
+            ]
 
-                print(" -", tool["function"]["name"])
+            print(
+                "\nTools sent to Qwen:"
+            )
 
-            # ------------------------------------------------
-            # System Prompt
-            # ------------------------------------------------
+            for tool in ollama_tools:
 
-            SystemPrompt = """ You are EduPath, an adaptive personalized learning agent.
+                print(
+                    " -",
+                    tool["function"]["name"]
+                )
 
-Your purpose is to create evidence-based, personalized learning journeys for a learner based on:
-
-- Current skills
-- Actual skill proficiency
-- Professional experience
-- Projects
-- Education
-- Certifications
-- Target role
-- Career goals
-- Identified skill gaps
-
-You have access to MCP tools. You MUST use the appropriate tools instead of pretending that an action was completed.
-
-============================================================
-CORE RULES
-============================================================
-
-1. NEVER invent learner information.
-
-2. NEVER invent:
-   - Skill ratings
-   - Experience
-   - Projects
-   - Certifications
-   - Target roles
-   - Career goals
-   - Skill gaps
-   - Learning progress
-
-3. A skill appearing on a resume does NOT mean the learner is highly
-   proficient in that skill.
-
-4. A certification does NOT prove practical expertise.
-
-5. Professional experience can be used as evidence that the learner has
-   encountered or worked with a technology, but it must NOT automatically
-   be converted into a 1-5 proficiency rating.
-
-6. If the learner has not provided a proficiency rating, DO NOT guess one.
-
-7. If important information is missing, ask the learner instead of making
-   assumptions.
-
-8. Do not create a generic curriculum.
-
-9. Every roadmap must be based on evidence about this specific learner.
-
-10. Do not provide the final roadmap until the required analysis and
-    persistence steps have been completed.
-
-============================================================
-PROFICIENCY RATINGS
-============================================================
-
-When asking the learner to rate a skill, use this scale:
-
-1 = Very basic / beginner
-2 = Basic understanding
-3 = Comfortable / intermediate
-4 = Strong / advanced
-5 = Expert / highly experienced
-
-IMPORTANT:
-
-The learner must provide the rating.
-
-For example, if a resume says:
-
-Python (Basic)
-
-you may record:
-
-Python = "Basic according to resume"
-
-You MUST NOT convert this into:
-
-Python = 2
-
-unless the learner explicitly gives the rating 2.
-
-Similarly, if the resume says:
-
-Java Spring Boot
-
-you may record that the learner has experience with Java Spring Boot,
-but you MUST NOT automatically assign a rating of 4 or 5.
-
-============================================================
-PHASE 1 — ANALYZE LEARNER DOCUMENT
-============================================================
-
-If the user provides:
-
-- Resume
-- CV
-- Portfolio
-- Certificate
-- Project description
-- Learning document
-- Other learner-related document
-
-you MUST use:
-
-read_document
-
-to inspect it before creating the learner profile.
-
-Extract only information supported by the document.
-
-Separate information into:
-
-- Demonstrated skills
-- Self-described skills
-- Professional experience
-- Projects
-- Education
-- Certifications
-- Uncertain areas
-- Missing information
-
-Do not invent information that is not present in the document.
-
-============================================================
-PHASE 2 — CHECK REQUIRED LEARNER INFORMATION
-============================================================
-
-Before creating the final roadmap, determine whether the following
-information is available:
-
-1. Target role
-2. Career goal
-3. Learner's skill proficiency ratings for important skills
-
-If the target role is NOT explicitly known:
-
-ASK THE LEARNER for their target role.
-
-Do NOT infer the target role from the resume.
-
-If the career goal is NOT explicitly known:
-
-ASK THE LEARNER about their career goal.
-
-Do NOT invent a career goal.
-
-If important skill ratings are missing:
-
-ASK the learner to provide the ratings.
-
-Do not create the final roadmap until the necessary information is available.
-
-If you need multiple pieces of information, ask for them together in a
-clear questionnaire rather than asking one question at a time.
-
-Example:
-
-"Before I create your roadmap, I need:
-
-Target role:
-Career goal:
-
-Rate these skills from 1-5:
-Java:
-Spring Boot:
-Python:
-SQL:
-Docker:
-AWS:"
-
-Then WAIT for the learner's response.
-
-============================================================
-PHASE 3 — SAVE LEARNER PROFILE
-============================================================
-
-Once sufficient learner information is available:
-
-Use:
-
-save_learner_profile
-
-The learner profile should contain information such as:
-
-- Name
-- Current skills
-- Skill ratings provided by the learner
-- Experience
-- Projects
-- Certifications
-- Education
-- Target role
-- Career goals
-- Uncertain areas
-
-Do not invent missing values.
-
-Use null, "unknown", or "not provided" where appropriate.
-
-After calling save_learner_profile, verify that the tool returned a
-successful result.
-
-============================================================
-PHASE 4 — SKILL GAP ANALYSIS
-============================================================
-
-After the learner profile has been saved:
-
-Analyze the learner against their target role and career goal.
-
-Identify:
-
-1. Existing strengths
-2. Required skills already demonstrated
-3. Skills that require improvement
-4. Missing skills
-5. Uncertain skills
-6. Important prerequisites
-
-Distinguish between:
-
-- Demonstrated knowledge
-- Learner-reported proficiency
-- Resume-listed knowledge
-- Unverified knowledge
-- Missing knowledge
-
-Do not claim that the learner has a skill gap unless there is evidence
-supporting that conclusion.
-
-Then use:
-
-save_skill_gap_analysis
-
-to persist the analysis.
-
-Do not merely describe the skill-gap analysis in your response.
-Actually call the MCP tool.
-
-============================================================
-PHASE 5 — LEARNING RESOURCE RESEARCH
-============================================================
-
-For every important identified skill gap:
-
-Use:
-
-search_learning_resources
-
-with an appropriate:
-
-- topic
-- level
-
-The level must be based on the learner's actual proficiency and the
-requirements of the target role.
-
-Do not automatically choose "beginner" simply because a technology is
-uncertain.
-
-Use the learner's provided proficiency and diagnostic information.
-
-The search results are INPUT DATA for constructing the roadmap.
-
-IMPORTANT:
-
-Do NOT stop after search_learning_resources.
-
-Do NOT simply summarize the search results to the learner.
-
-After receiving search results, continue the EduPath workflow.
-
-Use read_web_page when you need additional information about a resource.
-
-Prefer relevant resources over large lists of resources.
-
-============================================================
-PHASE 6 — CREATE LEARNING OBJECTIVES
-============================================================
-
-For every important skill gap, create specific learning objectives.
-
-Objectives should be:
-
-- Specific
-- Measurable
-- Relevant to the target role
-- Appropriate for the learner's current level
-- Practical
-
-Avoid generic objectives such as:
-
-"Learn Python."
-
-Instead use objectives such as:
-
-"Implement REST APIs in Python using FastAPI and explain request,
-response, validation, and error-handling flows."
-
-============================================================
-PHASE 7 — CREATE PERSONALIZED ROADMAP
-============================================================
-
-Create a step-by-step weekly roadmap.
-
-Each week MUST contain:
-
-1. Week number
-2. Focus area
-3. Concepts
-4. Learning objectives
-5. Selected learning resources
-6. Practice tasks
-7. Project work
-8. Completion criteria
-
-The roadmap must connect the learner's:
-
-CURRENT STATE
-        ↓
-SKILL GAPS
-        ↓
-LEARNING OBJECTIVES
-        ↓
-PRACTICE
-        ↓
-PROJECTS
-        ↓
-TARGET ROLE
-
-Do not create a generic sequence of courses.
-
-Use the learner's existing experience to avoid unnecessarily repeating
-things they already know.
-
-For example, if the learner already has Java Spring Boot experience,
-the roadmap should build upon that experience when appropriate instead
-of treating the learner as a completely new programmer.
-
-============================================================
-PHASE 8 — SAVE ROADMAP
-============================================================
-
-After creating the roadmap:
-
-Use:
-
-save_learning_roadmap
-
-to persist it.
-
-Do NOT claim that the roadmap has been saved unless the MCP tool
-actually succeeds.
-
-============================================================
-PHASE 9 — TRACK PROGRESS
-============================================================
-
-After the roadmap has been successfully saved:
-
-Initialize or update learner progress using:
-
-update_learning_progress
-
-Track:
-
-- Current week
-- Completed objectives
-- In-progress objectives
-- Pending objectives
-- Difficulty or blockers if provided
-
-Do not invent progress.
-
-If the learner has not started the roadmap, do not claim that anything
-has been completed.
-
-============================================================
-PHASE 10 — ADAPTIVE LEARNING
-============================================================
-
-If the learner later reports difficulty:
-
-1. Identify the specific difficult topic.
-2. Determine whether the problem is caused by a prerequisite gap.
-3. Adjust the roadmap accordingly.
-4. Add prerequisite learning if necessary.
-5. Update the learner's progress.
-6. Update the roadmap if required.
-
-Do not simply tell the learner to study harder.
-
-============================================================
-CRITICAL WORKFLOW RULE
-============================================================
-
-The following sequence represents the normal EduPath workflow:
-
-READ DOCUMENT
-      ↓
-CHECK REQUIRED INFORMATION
-      ↓
-ASK LEARNER FOR MISSING INFORMATION
-      ↓
-SAVE LEARNER PROFILE
-      ↓
-ANALYZE SKILL GAPS
-      ↓
-SAVE SKILL GAP ANALYSIS
-      ↓
-SEARCH LEARNING RESOURCES
-      ↓
-CREATE LEARNING OBJECTIVES
-      ↓
-CREATE WEEKLY ROADMAP
-      ↓
-SAVE LEARNING ROADMAP
-      ↓
-UPDATE LEARNING PROGRESS
-      ↓
-FINAL RESPONSE
-
-IMPORTANT:
-
-A search result is NOT a final answer.
-
-A resource summary is NOT a final answer.
-
-A learner profile is NOT a final answer.
-
-A skill-gap analysis is NOT a final answer.
-
-The final answer should contain the personalized roadmap only after the
-required workflow has been completed.
-
-============================================================
-TOOL EXECUTION RULES
-============================================================
-
-When an MCP tool is required:
-
-1. Call the tool.
-2. Wait for its result.
-3. Inspect the result.
-4. Use the result in the next step.
-5. Continue the workflow.
-
-Never pretend that a tool was called.
-
-Never pretend that a file was saved.
-
-Never pretend that a roadmap was created or saved.
-
-If a tool returns an error:
-
-- Identify the error.
-- Attempt a reasonable correction if possible.
-- Do not claim success if the operation failed.
-
-============================================================
-FINAL RESPONSE
-============================================================
-
-Only provide the final roadmap when:
-
-- Learner information is sufficient
-- Learner profile has been saved
-- Skill-gap analysis has been created and saved
-- Relevant resources have been researched
-- Roadmap has been created
-- Roadmap has been saved
-- Progress has been initialized or updated
-
-The final response should include:
-
-1. Learner summary
-2. Target role
-3. Current skill profile
-4. Identified skill gaps
-5. Learning objectives
-6. Weekly roadmap
-7. Projects
-8. Completion criteria
-9. How progress will be tracked
-
-Keep the response clear and practical.
-
-Do not dump every search result into the final response.
-
-Select the resources that are most relevant to the learner.
-
-============================================================
-IMPORTANT FINAL RULE
-============================================================
-
-NEVER invent information to make the workflow appear complete.
-
-If information is missing, ask the learner.
-
-If a required MCP operation has not been completed, continue the
-workflow rather than producing the final roadmap.
-"""
-
-            # ------------------------------------------------
-            # Conversation
-            # ------------------------------------------------
+            # =================================================
+            # USER CONVERSATION
+            # =================================================
 
             while True:
 
-                UserMsg = input("\nYou: ")
+                print(
+                    "\n"
+                )
 
-                if UserMsg == "/bye":
+                user_message = input(
+                    "You: "
+                ).strip()
+
+                if not user_message:
+                    continue
+
+                if user_message.lower() == "/bye":
                     break
 
-                add_user_message(UserMsg)
+                # =================================================
+                # NEW DOCUMENT
+                # =================================================
 
-                # ============================================
-                # ASK QWEN
-                # ============================================
+                document_path = (
+                    extract_document_path(
+                        user_message
+                    )
+                )
 
-                payload = build_payload(SystemPrompt, MCP_TOOLS)
+                if document_path:
 
-                AI_response = prompt_ai(payload)
+                    # Reset workflow for a new learner document.
 
-                result = AI_response.json()
+                    workflow_state.clear()
 
-                print("\nQwen response:")
-                print(result)
+                    workflow_state.update({
 
-                # ============================================
-                # TOOL LOOP
-                # ============================================
+                        "phase":
+                            "WAITING_FOR_DOCUMENT",
 
-                while True:
+                        "document": {
+                            "loaded": False,
+                            "path": None,
+                            "content": None
+                        },
 
-                    tool_calls = result.get("message", {}).get("tool_calls")
+                        "resume_facts":
+                            None,
 
-                    # ========================================================
-                    # NO TOOL CALL
-                    # ========================================================
+                        "learner_input": {
+                            "target_role": None,
+                            "career_goal": None,
+                            "skill_ratings": {},
+                            "learning_preferences": {}
+                        },
 
-                    if not tool_calls:
+                        "learner_profile":
+                            None,
 
-                        content = result["message"].get("content", "")
+                        "skill_gaps":
+                            None,
 
-                        workflow_complete = (
-                            workflow_state["profile_saved"]
-                            and workflow_state["skill_gap_saved"]
-                            and workflow_state["roadmap_saved"]
-                            and workflow_state["progress_saved"]
+                        "resources":
+                            [],
+
+                        "roadmap":
+                            None,
+
+                        "progress_initialized":
+                            False,
+
+                        "completed":
+                            False
+                    })
+
+                    add_user_message(
+                        user_message
+                    )
+
+                    # -----------------------------------------
+                    # Tell Qwen exact path.
+                    # -----------------------------------------
+
+                    ConversationWindow.append({
+                        "role": "user",
+                        "content": (
+                            "The learner document is located at:\n"
+                            + document_path
+                            + "\n\n"
+                            "Read this exact file."
                         )
+                    })
 
-                        # -----------------------------------------------
-                        # Workflow is complete
-                        # -----------------------------------------------
+                    # -----------------------------------------
+                    # STEP 1: READ DOCUMENT
+                    # -----------------------------------------
 
-                        if workflow_complete:
+                    success = (
+                        await process_document_phase(
+                            session,
+                            ollama_tools
+                        )
+                    )
 
-                            add_ai_message(content)
+                    if not success:
 
-                            print("\nAI:", content)
-
-                            break
-
-                        # -----------------------------------------------
-                        # Workflow is NOT complete
-                        # -----------------------------------------------
-
-                        print("\nQwen stopped before completing the workflow.")
-
-                        ConversationWindow.append({
-                            "role": "user",
-                            "content": (
-                                "Do not finish yet. Continue the EduPath workflow. "
-                                "Complete all required steps and use the appropriate MCP "
-                                "tools before providing the final roadmap."
-                            )
-                        })
-
-                        PAYLOAD = build_payload(SystemPrompt, MCP_TOOLS)
-
-                        AI_RESPONSE = prompt_ai(PAYLOAD)
-
-                        result = AI_RESPONSE.json()
+                        print(
+                            "\nCould not read the learner document."
+                        )
 
                         continue
 
-                    # ========================================================
-                    # TOOL CALLS EXIST
-                    # ========================================================
+                    # -----------------------------------------
+                    # STEP 2: EXTRACT RESUME FACTS
+                    # -----------------------------------------
 
-                    for tool in tool_calls:
+                    success = (
+                        await extract_resume_facts()
+                    )
 
-                        tool_ID = tool["id"]
+                    if not success:
 
-                        tool_Name = tool["function"]["name"]
-
-                        tool_Arguments = tool["function"]["arguments"]
-
-                        print("\nQwen requested MCP tool:")
-                        print("Tool:", tool_Name)
-                        print("Arguments:", tool_Arguments)
-
-                        # ====================================================
-                        # MCP CALL
-                        # ====================================================
-
-                        MCP_Result = await session.call_tool(
-                            tool_Name,
-                            arguments=tool_Arguments
+                        print(
+                            "\nCould not extract learner facts."
                         )
 
-                        print("\nMCP Result:")
-                        print(MCP_Result)
+                        continue
 
-                        # ====================================================
-                        # UPDATE WORKFLOW STATE
-                        # ====================================================
+                    print(
+                        "\n========================================"
+                    )
 
-                        if tool_Name == "save_learner_profile":
-                            workflow_state["profile_saved"] = True
+                    print(
+                        "Resume facts extracted"
+                    )
 
-                        elif tool_Name == "save_skill_gap_analysis":
-                            workflow_state["skill_gap_saved"] = True
+                    print(
+                        "========================================"
+                    )
 
-                        elif tool_Name == "save_learning_roadmap":
-                            workflow_state["roadmap_saved"] = True
+                    print(
+                        json.dumps(
+                            workflow_state[
+                                "resume_facts"
+                            ],
+                            indent=2,
+                            ensure_ascii=False
+                        )
+                    )
 
-                        elif tool_Name == "update_learning_progress":
-                            workflow_state["progress_saved"] = True
+                    # -----------------------------------------
+                    # STEP 3: ASK LEARNER
+                    # -----------------------------------------
 
-                        # ====================================================
-                        # EXTRACT RESULT
-                        # ====================================================
+                    workflow_state[
+                        "phase"
+                    ] = "PROFILE_INFORMATION"
 
-                        tool_result = extract_mcp_result(MCP_Result)
+                    if not request_missing_profile_information():
 
-                        print("\nResult sent to Qwen:")
-                        print(tool_result)
-
-                        # ====================================================
-                        # ADD TOOL RESULT TO CONVERSATION
-                        # ====================================================
-
-                        add_tool_message(
-                            tool_ID,
-                            tool_Name,
-                            tool_result
+                        print(
+                            "\nTarget role and career goal are required."
                         )
 
-                    # ========================================================
-                    # ASK QWEN TO CONTINUE AFTER TOOL EXECUTION
-                    # ========================================================
+                        continue
 
-                    PAYLOAD = build_payload(SystemPrompt, MCP_TOOLS)
+                    # -----------------------------------------
+                    # STEP 4: BUILD + SAVE PROFILE
+                    # -----------------------------------------
 
-                    AI_RESPONSE = prompt_ai(PAYLOAD)
+                    success = await save_profile(
+                        session,
+                        ollama_tools
+                    )
 
-                    result = AI_RESPONSE.json()
+                    if not success:
+                        continue
 
-                    print("\nQwen after MCP tool:")
-                    print(result)
+                    # -----------------------------------------
+                    # STEP 5: SKILL GAP
+                    # -----------------------------------------
 
+                    success = (
+                        await create_skill_gap_analysis(
+                            session,
+                            ollama_tools
+                        )
+                    )
+
+                    if not success:
+                        continue
+
+                    # -----------------------------------------
+                    # STEP 6: RESOURCES
+                    # -----------------------------------------
+
+                    await research_resources(
+                        session,
+                        ollama_tools
+                    )
+
+                    # -----------------------------------------
+                    # STEP 7: ROADMAP
+                    # -----------------------------------------
+
+                    success = await create_roadmap(
+                        session
+                    )
+
+                    if not success:
+                        continue
+
+                    # -----------------------------------------
+                    # STEP 8: PROGRESS
+                    # -----------------------------------------
+
+                    success = await initialize_progress(
+                        session
+                    )
+
+                    if not success:
+                        continue
+
+                    # -----------------------------------------
+                    # STEP 9: FINAL
+                    # -----------------------------------------
+
+                    print_final_result()
+
+                    continue
+
+                # =================================================
+                # NORMAL CHAT / FOLLOW-UP
+                # =================================================
+
+                add_user_message(
+                    user_message
+                )
+
+                # At this point you can later add:
+                #
+                # "I completed week 1"
+                #
+                # "I'm struggling with Spring Security"
+                #
+                # etc.
+                #
+                # Those should be handled by a separate
+                # progress-update workflow instead of restarting
+                # the resume workflow.
+
+                print(
+                    "\nEduPath:"
+                )
+
+                print(
+                    "Please provide a learner document "
+                    "(PDF/TXT) to start a learning plan."
+                )
+
+
+# ============================================================
+# ENTRY POINT
+# ============================================================
 
 if __name__ == "__main__":
 
-    asyncio.run(main())
+    asyncio.run(
+        main()
+    )
